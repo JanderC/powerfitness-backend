@@ -30,7 +30,18 @@ export function createApp() {
   app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
   app.use(compression());
   // CORS_ORIGIN: orígenes del frontend separados por coma (ej. http://localhost:5173,https://powerfitness.up.railway.app)
-  app.use(cors({ origin: env.CORS_ORIGIN.split(',').map((o) => o.trim()) }));
+  // Se normaliza a solo el origen: "https://x.vercel.app/login/" → "https://x.vercel.app"
+  const origins = env.CORS_ORIGIN.split(',')
+    .map((o) => o.trim())
+    .filter(Boolean)
+    .map((o) => {
+      try {
+        return new URL(o).origin;
+      } catch {
+        return o.replace(/\/+$/, '');
+      }
+    });
+  app.use(cors({ origin: origins }));
   // Fotos de clientes/productos en base64
   app.use(express.json({ limit: '8mb' }));
 
