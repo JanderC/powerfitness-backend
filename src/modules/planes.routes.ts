@@ -26,6 +26,9 @@ const planSchema = z
       .regex(/^#[0-9a-fA-F]{6}$/, 'Color inválido')
       .nullish(),
     activo: z.boolean().default(true),
+    // Plan grupal: el precio cubre a varias personas (ej. Promo Dúo = 2)
+    personas: z.coerce.number().int().min(1, 'Mínimo 1 persona').max(10, 'Máximo 10 personas').default(1),
+    promocional: z.boolean().default(false),
   })
   .transform((p) => {
     // Igual que el sistema original: duracion_dias aproximada para planes por meses/semanas/años
@@ -39,9 +42,10 @@ const planSchema = z
     return p;
   });
 
-const withDuracion = <T extends { tipoCalculoVencimiento: TipoCalculo; cantidadUnidades: number; duracionDias: number }>(p: T) => ({
+const withDuracion = <T extends { tipoCalculoVencimiento: TipoCalculo; cantidadUnidades: number; duracionDias: number; precio: number; personas: number }>(p: T) => ({
   ...p,
   duracionTexto: describirDuracion(p),
+  precioPorPersona: Math.round((p.precio / Math.max(p.personas, 1)) * 100) / 100,
 });
 
 planesRouter.get(

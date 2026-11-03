@@ -29,6 +29,7 @@ const vigentes = () =>
     .selectAll()
     .distinctOn('clienteId')
     .orderBy('clienteId')
+    .orderBy(sql`case when estado in ('activa', 'suspendida') then 0 else 1 end`)
     .orderBy('fechaVencimiento', 'desc')
     .orderBy('createdAt', 'desc');
 
@@ -46,6 +47,8 @@ const baseSelect = (vista: 'vigentes' | 'historial') =>
       'p.nombre as planNombre',
       'p.color as planColor',
       'p.precio as planPrecio',
+      'p.personas as planPersonas',
+      'p.promocional as planPromocional',
     ])
     .select((eb) =>
       eb
@@ -54,6 +57,15 @@ const baseSelect = (vista: 'vigentes' | 'historial') =>
         .where('d.estado', '=', 'pendiente')
         .select(sql<number>`coalesce(sum(d.saldo),0)::float`.as('s'))
         .as('saldoDeuda'),
+    )
+    .select((eb) =>
+      eb
+        .selectFrom('membresias as g')
+        .innerJoin('clientes as gc', 'gc.id', 'g.clienteId')
+        .whereRef('g.grupoId', '=', 'm.grupoId')
+        .whereRef('g.clienteId', '!=', 'm.clienteId')
+        .select(sql<{ id: string; nombre: string; apellido: string; cedula: string }[] | null>`json_agg(distinct jsonb_build_object('id', gc.id, 'nombre', gc.nombre, 'apellido', gc.apellido, 'cedula', gc.cedula))`.as('x'))
+        .as('companeros'),
     );
 
 /**
@@ -220,6 +232,7 @@ membresiasRouter.post(
     const body = parse(
       z.object({
         clienteId: z.string().uuid('Selecciona un cliente'),
+        acompanantes: z.array(z.string().uuid('Selecciona los acompañantes')).max(9).optional(),
         planId: z.string().uuid('Selecciona un plan'),
         fechaInicio: fecha.optional(),
         montoPagado: z.coerce.number().min(0, 'Monto inválido'),
@@ -239,6 +252,7 @@ membresiasRouter.post(
     const body = parse(
       z.object({
         planId: z.string().uuid().optional(),
+        acompanantes: z.array(z.string().uuid()).max(9).optional(),
         montoPagado: z.coerce.number().min(0),
         metodoPago,
         desde: z.enum(['hoy', 'vencimiento']).default('vencimiento'),

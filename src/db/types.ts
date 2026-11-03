@@ -70,6 +70,8 @@ export interface PlanesTable {
   updatedAt: Ts;
   tipoCalculoVencimiento: Def<TipoCalculo>;
   cantidadUnidades: Def<number>;
+  personas: Def<number>;
+  promocional: Def<boolean>;
 }
 
 export type EstadoMembresia = 'activa' | 'vencida' | 'suspendida' | 'cancelada';
@@ -87,6 +89,7 @@ export interface MembresiasTable {
   createdAt: DateOnly;
   updatedAt: DateOnly;
   fechaSuspension: string | null;
+  grupoId: Def<string | null>;
 }
 
 export interface PagosTable {

@@ -26,6 +26,7 @@ dashboardRouter.get(
       .selectAll()
       .distinctOn('clienteId')
       .orderBy('clienteId')
+      .orderBy(sql`case when estado in ('activa', 'suspendida') then 0 else 1 end`)
       .orderBy('fechaVencimiento', 'desc')
       .as('m');
 

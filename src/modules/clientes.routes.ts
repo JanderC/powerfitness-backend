@@ -177,7 +177,18 @@ clientesRouter.get(
         .selectFrom('membresias as m')
         .innerJoin('planes as p', 'p.id', 'm.planId')
         .selectAll('m')
-        .select(['p.nombre as planNombre', 'p.color as planColor', 'p.precio as planPrecio'])
+        .select(['p.nombre as planNombre', 'p.color as planColor', 'p.precio as planPrecio', 'p.personas as planPersonas'])
+        .select((eb) =>
+          eb
+            .selectFrom('membresias as g')
+            .innerJoin('clientes as gc', 'gc.id', 'g.clienteId')
+            .whereRef('g.grupoId', '=', 'm.grupoId')
+            .whereRef('g.clienteId', '!=', 'm.clienteId')
+            .select(
+              sql<{ id: string; nombre: string; apellido: string; cedula: string }[] | null>`json_agg(distinct jsonb_build_object('id', gc.id, 'nombre', gc.nombre, 'apellido', gc.apellido, 'cedula', gc.cedula))`.as('x'),
+            )
+            .as('companeros'),
+        )
         .where('m.clienteId', '=', cliente.id)
         .orderBy('m.fechaInicio', 'desc')
         .execute(),
