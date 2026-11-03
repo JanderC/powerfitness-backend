@@ -7,6 +7,7 @@ import { addDays, isDateStr, parseDateStr, today } from '../lib/dates.js';
 import { ah, badRequest, notFound, parse } from '../lib/http.js';
 import { cop, r2 } from '../lib/money.js';
 import { requireRole, userId } from '../middleware/auth.js';
+import { registrarMovimientoCaja } from './caja.service.js';
 
 // ═════════════════════════════ PRODUCTOS ═════════════════════════════
 export const productosRouter = Router();
@@ -286,23 +287,17 @@ ventasRouter.post(
       }
 
       if (pagado > 0) {
-        await trx
-          .insertInto('movimientosCaja')
-          .values({
-            tipo: 'ingreso',
-            categoria: 'producto',
-            monto: pagado,
-            descripcion:
-              `Venta de ${resumen} - ${cliente ? `${cliente.nombre} ${cliente.apellido}` : 'Venta rápida'}` +
-              (saldo > 0 ? ` (Pago parcial, saldo: ${cop(saldo)})` : ''),
-            referenciaId: ventas[0].id,
-            usuarioId: uid,
-            metodoPago: body.metodoPago,
-            fecha: new Date(),
-            cierreCajaId: null,
-            movimientoCajaFuerteId: null,
-          })
-          .execute();
+        await registrarMovimientoCaja(trx, {
+          tipo: 'ingreso',
+          categoria: 'producto',
+          monto: pagado,
+          descripcion:
+            `Venta de ${resumen} - ${cliente ? `${cliente.nombre} ${cliente.apellido}` : 'Venta rápida'}` +
+            (saldo > 0 ? ` (Pago parcial, saldo: ${cop(saldo)})` : ''),
+          referenciaId: ventas[0].id,
+          usuarioId: uid,
+          metodoPago: body.metodoPago,
+        });
       }
       return { ventas, total, pagado, saldo, deudaId };
     });

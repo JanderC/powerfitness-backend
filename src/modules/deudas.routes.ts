@@ -6,6 +6,7 @@ import { diffDays, isDateStr, today } from '../lib/dates.js';
 import { ah, badRequest, notFound, parse } from '../lib/http.js';
 import { cop, r2, sum } from '../lib/money.js';
 import { userId } from '../middleware/auth.js';
+import { registrarMovimientoCaja } from './caja.service.js';
 
 /** Unifica DeudasController + HistorialDeudaController del sistema .NET. */
 export const deudasRouter = Router();
@@ -150,21 +151,15 @@ deudasRouter.post(
         .insertInto('abonosDeuda')
         .values({ deudaId: d.id, monto: b.monto, metodoPago: b.metodoPago, notas: b.notas || `Abono — ${d.concepto}` })
         .execute();
-      await trx
-        .insertInto('movimientosCaja')
-        .values({
-          tipo: 'ingreso',
-          categoria: 'abono_deuda',
-          metodoPago: b.metodoPago,
-          monto: b.monto,
-          descripcion: `Abono deuda — ${d.nombre} ${d.apellido} — ${d.concepto}`,
-          referenciaId: d.id,
-          usuarioId: uid,
-          fecha: new Date(),
-          cierreCajaId: null,
-          movimientoCajaFuerteId: null,
-        })
-        .execute();
+      await registrarMovimientoCaja(trx, {
+        tipo: 'ingreso',
+        categoria: 'abono_deuda',
+        metodoPago: b.metodoPago,
+        monto: b.monto,
+        descripcion: `Abono deuda — ${d.nombre} ${d.apellido} — ${d.concepto}`,
+        referenciaId: d.id,
+        usuarioId: uid,
+      });
       const montoPagado = r2(d.montoPagado + b.monto);
       const saldo = Math.max(r2(d.montoTotal - montoPagado), 0);
       const estado = saldo <= 0 ? 'pagada' : 'pendiente';

@@ -80,6 +80,18 @@ Toda la lógica de los controladores `Controllers/API/*.cs` y los reportes de `C
 | EmpleadosController | `empleados.routes.ts` |
 | DashboardController + ReportesController + NotificationService | `dashboard.routes.ts` |
 
+## Caja por sesiones
+
+La caja diaria ya no se cierra por día ni por horario: trabaja por **sesiones (turnos)**.
+
+1. **Apertura** con un monto inicial (base). Origen: lo que se dejó en el cierre anterior (se sugiere solo), retirado de Caja Fuerte (se descuenta de su efectivo) u otro origen.
+2. Mientras la sesión está abierta, **todo** cobro o pago (mensualidades, ventas, abonos, salarios, ingresos/egresos manuales, envíos desde Caja Fuerte) queda ligado a ella. Con la caja cerrada la API responde `409` y la interfaz lo avisa.
+3. **Cierre con arqueo**: se cuenta el efectivo (por billetes/monedas o total), se compara con el esperado (`base + ingresos − egresos en efectivo`) y se registra sobrante/faltante (con observación obligatoria). Se elige cuánto dejar como base del siguiente turno; el resto del efectivo y las transferencias netas pasan a Caja Fuerte. Se imprime un comprobante.
+
+Solo puede haber una sesión abierta a la vez. Tabla `sesiones_caja` (migración `002_sesiones_caja.sql`); `movimientos_caja.sesion_caja_id` y `cierres_caja.sesion_caja_id/efectivo_contado/diferencia`.
+
+Endpoints: `GET /api/caja/sesion`, `POST /api/caja/abrir`, `POST /api/caja/cerrar`, `GET /api/caja/sesiones`, `GET /api/caja/sesiones/:id`.
+
 Las reglas de negocio se conservan: cálculo de vencimiento (`meses` suma meses calendario, `días` cuenta el día de inicio), un check-in cada 12 h, deuda automática por pagos parciales, ingreso en caja por cada cobro, cierre de caja que envía efectivo/transferencias a Caja Fuerte, eliminación con auditoría y reverso en cascada entre cajas.
 
 ## Mejoras en mensualidades
@@ -99,7 +111,7 @@ Las reglas de negocio se conservan: cálculo de vencimiento (`meses` suma meses 
 - **Tareas automáticas** (`backend/src/jobs/scheduler.ts`, configurables en `.env`):
   - Revisión diaria: vence mensualidades, genera avisos de "por vencer"/"vencida" y de stock bajo, limpia notificaciones viejas. También corre al iniciar, por si el equipo estuvo apagado.
   - Consolidación mensual automática de Caja Fuerte (día 1).
-  - Cierre automático de caja al final del día (desactivado por defecto: `JOB_CIERRE_CAJA_AUTO=true` para activarlo).
+  - Aviso si una sesión de caja lleva más de `CAJA_ALERTA_HORAS` (14 h) abierta.
 - Notificaciones en el panel (campana), alertas de días sin cerrar en Caja Diaria y diagnóstico/sincronización del balance de Caja Fuerte.
 
 ## Seguridad

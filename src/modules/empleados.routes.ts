@@ -5,6 +5,7 @@ import { isDateStr, today } from '../lib/dates.js';
 import { ah, badRequest, notFound, parse } from '../lib/http.js';
 import { cop, sum } from '../lib/money.js';
 import { userId } from '../middleware/auth.js';
+import { registrarMovimientoCaja } from './caja.service.js';
 
 export const empleadosRouter = Router();
 
@@ -107,21 +108,15 @@ empleadosRouter.post(
         .values({ empleadoId: e.id, monto: b.monto, periodo: b.periodo, metodoPago: b.metodoPago, notas: b.notas || null, fechaPago: new Date() })
         .returning('id')
         .executeTakeFirstOrThrow();
-      await trx
-        .insertInto('movimientosCaja')
-        .values({
-          tipo: 'egreso',
-          categoria: 'salario',
-          monto: b.monto,
-          descripcion: `Pago salario ${b.periodo} - ${e.nombre} ${e.apellido}`,
-          referenciaId: pago.id,
-          usuarioId: uid,
-          metodoPago: b.metodoPago,
-          fecha: new Date(),
-          cierreCajaId: null,
-          movimientoCajaFuerteId: null,
-        })
-        .execute();
+      await registrarMovimientoCaja(trx, {
+        tipo: 'egreso',
+        categoria: 'salario',
+        monto: b.monto,
+        descripcion: `Pago salario ${b.periodo} - ${e.nombre} ${e.apellido}`,
+        referenciaId: pago.id,
+        usuarioId: uid,
+        metodoPago: b.metodoPago,
+      });
     });
     res.json({ success: true, message: `Pago de ${cop(b.monto)} registrado` });
   }),

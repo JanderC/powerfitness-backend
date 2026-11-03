@@ -1,11 +1,20 @@
 import { Router } from 'express';
+import { sql } from 'kysely';
 import { z } from 'zod';
 import { db } from '../db/index.js';
 import { addDays, isDateStr, nombreDia, parseDateStr, toDateStr, today } from '../lib/dates.js';
 import { ah, badRequest, notFound, parse } from '../lib/http.js';
-import { sum, totalesMovimientos } from '../lib/money.js';
+import { cop, sum, totalesMovimientos } from '../lib/money.js';
 import { requireRole, userId } from '../middleware/auth.js';
-import { ajustarBalance, cerrarCaja, inicioPeriodoActual, movimientosPeriodoActual } from './caja.service.js';
+import {
+  abrirCaja,
+  ajustarBalance,
+  baseSugerida,
+  cerrarSesion,
+  movimientosDeSesion,
+  registrarMovimientoCaja,
+  resumenSesion,
+} from './caja.service.js';
 
 /** Caja diaria (CajaController del sistema .NET). */
 export const cajaRouter = Router();
@@ -17,33 +26,146 @@ export const CATEGORIAS_CAJA = {
 
 cajaRouter.get('/categorias', (_req, res) => res.json(CATEGORIAS_CAJA));
 
-/** Panel: totales del periodo actual (desde el último cierre de hoy), control de cierre y alertas. */
+const SESION_COLS = [
+  's.id',
+  's.estado',
+  's.montoInicial',
+  's.origenMontoInicial',
+  's.fechaApertura',
+  's.observacionesApertura',
+  's.fechaCierre',
+  's.cierreCajaId',
+  's.efectivoEsperado',
+  's.efectivoContado',
+  's.diferencia',
+  's.efectivoDejado',
+  's.observacionesCierre',
+  'ua.nombre as usuarioAperturaNombre',
+  'uc.nombre as usuarioCierreNombre',
+] as const;
+
+const sesionQuery = () =>
+  db
+    .selectFrom('sesionesCaja as s')
+    .innerJoin('usuarios as ua', 'ua.id', 's.usuarioApertura')
+    .leftJoin('usuarios as uc', 'uc.id', 's.usuarioCierre')
+    .select([...SESION_COLS]);
+
+/** Estado de la caja: sesión abierta (con totales y movimientos) o datos para abrirla. */
 cajaRouter.get(
-  '/dashboard',
+  '/sesion',
   ah(async (_req, res) => {
-    const hoy = today();
-    const movs = await movimientosPeriodoActual(hoy);
-    const ultimoCierre = await db
-      .selectFrom('cierresCaja')
-      .select(['id', 'fechaCierre', 'createdAt', 'tipoCierre', 'balanceGeneral', 'efectivoFinal', 'cantidadMovimientos'])
-      .orderBy('createdAt', 'desc')
-      .executeTakeFirst();
-    const anteriores = await db
-      .selectFrom('movimientosCaja')
-      .select((eb) => eb.fn.countAll<number>().as('n'))
-      .where('cerrado', '=', false)
-      .where('fecha', '<', parseDateStr(hoy))
-      .executeTakeFirstOrThrow();
-    const yaSeCerroHoy = !!ultimoCierre && toDateStr(new Date(ultimoCierre.fechaCierre)) === hoy;
+    const sesion = await sesionQuery().where('s.estado', '=', 'abierta').executeTakeFirst();
+    if (!sesion) {
+      const [sugerida, ultima, pendientes] = await Promise.all([
+        baseSugerida(),
+        sesionQuery().where('s.estado', '=', 'cerrada').orderBy('s.fechaCierre', 'desc').executeTakeFirst(),
+        db
+          .selectFrom('movimientosCaja')
+          .select((eb) => eb.fn.countAll<number>().as('n'))
+          .where('cerrado', '=', false)
+          .where('sesionCajaId', 'is', null)
+          .executeTakeFirstOrThrow(),
+      ]);
+      return res.json({ abierta: false, baseSugerida: sugerida, ultimaSesion: ultima ?? null, movimientosSinSesion: pendientes.n });
+    }
+    const movs = await movimientosDeSesion(sesion.id);
     res.json({
-      fecha: hoy,
-      inicioPeriodo: await inicioPeriodoActual(hoy),
-      cajaHoy: { ...totalesMovimientos(movs), cantidad: movs.length },
+      abierta: true,
+      sesion,
+      resumen: resumenSesion(sesion.montoInicial, movs),
       movimientos: movs.slice().reverse(),
-      ultimoCierre,
-      controlCierre: { yaSeCerroHoy, horaUltimoCierre: yaSeCerroHoy ? ultimoCierre!.createdAt : null },
-      alertas: { movimientosPendientesAnteriores: anteriores.n, tieneMovimientosPendientesAnteriores: anteriores.n > 0 },
     });
+  }),
+);
+
+cajaRouter.post(
+  '/abrir',
+  ah(async (req, res) => {
+    const b = parse(
+      z.object({
+        montoInicial: z.coerce.number().min(0, 'El monto inicial no puede ser negativo'),
+        origen: z.enum(['anterior', 'caja_fuerte', 'externo']).default('anterior'),
+        observaciones: z.string().trim().max(500).nullish(),
+      }),
+      req.body,
+    );
+    const r = await abrirCaja(b, userId(req));
+    res.status(201).json({
+      success: true,
+      ...r,
+      message:
+        `Caja abierta con ${cop(b.montoInicial)} de base` +
+        (r.movimientosAdoptados ? `. Se incluyeron ${r.movimientosAdoptados} movimientos pendientes sin cerrar.` : ''),
+    });
+  }),
+);
+
+/** Cierre de la sesión con arqueo de efectivo. */
+cajaRouter.post(
+  '/cerrar',
+  ah(async (req, res) => {
+    const b = parse(
+      z.object({
+        efectivoContado: z.coerce.number().min(0, 'Ingresa el efectivo contado'),
+        efectivoADejar: z.coerce.number().min(0).default(0),
+        observaciones: z.string().trim().max(500).nullish(),
+      }),
+      req.body,
+    );
+    const r = await cerrarSesion(b, userId(req));
+    const d = r.resumen.diferencia;
+    res.json({
+      success: true,
+      ...r,
+      message: d === 0 ? 'Caja cerrada. ¡El arqueo cuadró!' : d > 0 ? `Caja cerrada con sobrante de ${cop(d)}` : `Caja cerrada con faltante de ${cop(-d)}`,
+    });
+  }),
+);
+
+/** Historial de sesiones (turnos). */
+cajaRouter.get(
+  '/sesiones',
+  ah(async (req, res) => {
+    const limite = Math.min(Number(req.query.limite) || 50, 500);
+    const rows = await sesionQuery()
+      .select((eb) => [
+        eb
+          .selectFrom('movimientosCaja as m')
+          .whereRef('m.sesionCajaId', '=', 's.id')
+          .select(sql<number>`count(*)::int`.as('n'))
+          .as('cantidadMovimientos'),
+        eb
+          .selectFrom('movimientosCaja as m')
+          .whereRef('m.sesionCajaId', '=', 's.id')
+          .where('m.tipo', '=', 'ingreso')
+          .select(sql<number>`coalesce(sum(m.monto),0)::float`.as('t'))
+          .as('totalIngresos'),
+        eb
+          .selectFrom('movimientosCaja as m')
+          .whereRef('m.sesionCajaId', '=', 's.id')
+          .where('m.tipo', '=', 'egreso')
+          .select(sql<number>`coalesce(sum(m.monto),0)::float`.as('t'))
+          .as('totalEgresos'),
+        eb.selectFrom('cierresCaja as c').whereRef('c.id', '=', 's.cierreCajaId').select('c.efectivoFinal').as('efectivoEnviado'),
+      ])
+      .orderBy('s.fechaApertura', 'desc')
+      .limit(limite)
+      .execute();
+    res.json(rows);
+  }),
+);
+
+cajaRouter.get(
+  '/sesiones/:id',
+  ah(async (req, res) => {
+    const sesion = await sesionQuery().where('s.id', '=', req.params.id).executeTakeFirst();
+    if (!sesion) throw notFound('Sesión no encontrada');
+    const movs = await movimientosDeSesion(sesion.id);
+    const cierre = sesion.cierreCajaId
+      ? await db.selectFrom('cierresCaja').selectAll().where('id', '=', sesion.cierreCajaId).executeTakeFirst()
+      : null;
+    res.json({ sesion, resumen: resumenSesion(sesion.montoInicial, movs), movimientos: movs, cierre });
   }),
 );
 
@@ -74,26 +196,6 @@ cajaRouter.get(
       };
     });
     res.json({ periodo: { desde, hasta: hoy }, dias, totales: totalesMovimientos(movs) });
-  }),
-);
-
-/** Días anteriores que quedaron sin cerrar. */
-cajaRouter.get(
-  '/pendientes',
-  ah(async (_req, res) => {
-    const movs = await db.selectFrom('movimientosCaja').selectAll().where('cerrado', '=', false).orderBy('fecha').execute();
-    const porFecha = new Map<string, typeof movs>();
-    for (const m of movs) {
-      const k = toDateStr(new Date(m.fecha));
-      porFecha.set(k, [...(porFecha.get(k) ?? []), m]);
-    }
-    res.json({
-      cantidadTotal: movs.length,
-      dias: [...porFecha.entries()].map(([fecha, ms]) => {
-        const t = totalesMovimientos(ms);
-        return { fecha, cantidad: ms.length, totalIngresos: t.totalIngresos, totalEgresos: t.totalEgresos, balance: t.balance };
-      }),
-    });
   }),
 );
 
@@ -138,19 +240,7 @@ cajaRouter.post(
       }),
       req.body,
     );
-    const mov = await db
-      .insertInto('movimientosCaja')
-      .values({
-        ...b,
-        referenciaId: null,
-        usuarioId: userId(req),
-        fecha: new Date(),
-        cerrado: false,
-        cierreCajaId: null,
-        movimientoCajaFuerteId: null,
-      })
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    const mov = await registrarMovimientoCaja(db, { ...b, referenciaId: null, usuarioId: userId(req) });
     res.status(201).json({ success: true, movimiento: mov, message: `${b.tipo === 'ingreso' ? 'Ingreso' : 'Egreso'} registrado` });
   }),
 );
@@ -215,22 +305,6 @@ cajaRouter.delete(
       await trx.deleteFrom('movimientosCaja').where('id', '=', m.id).execute();
     });
     res.json({ success: true, message: 'Movimiento eliminado y registrado en auditoría' });
-  }),
-);
-
-cajaRouter.post(
-  '/cerrar',
-  ah(async (req, res) => {
-    const b = parse(
-      z.object({
-        fecha: z.string().refine(isDateStr).optional(),
-        efectivoADejar: z.coerce.number().min(0).optional(),
-        observaciones: z.string().trim().max(500).nullish(),
-      }),
-      req.body,
-    );
-    const r = await cerrarCaja({ ...b, fecha: b.fecha?.slice(0, 10), tipoCierre: 'manual' }, userId(req));
-    res.json({ success: true, ...r, message: 'Caja cerrada correctamente' });
   }),
 );
 

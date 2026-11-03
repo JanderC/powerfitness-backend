@@ -6,7 +6,7 @@ import cron from 'node-cron';
 import { env } from '../config/env.js';
 import { db } from '../db/index.js';
 import { addDays, diffDays, formatDMY, parseDateStr, today } from '../lib/dates.js';
-import { cerrarDiasPendientes } from '../modules/caja.service.js';
+import { obtenerSesionAbierta } from '../modules/caja.service.js';
 import { consolidarMes } from '../modules/caja-fuerte.routes.js';
 
 const log = (msg: string) => console.log(`[${new Date().toLocaleString('es-CO')}] ⚙ ${msg}`);
@@ -127,9 +127,29 @@ export async function consolidacionAutomatica() {
   log(`Consolidado automático de ${mes}/${anio} (${n} movimientos)`);
 }
 
-async function usuarioSistema() {
-  const u = await db.selectFrom('usuarios').select('id').where('rol', '=', 'admin').where('activo', '=', true).orderBy('createdAt').executeTakeFirst();
-  return u?.id;
+/**
+ * La caja se cierra por sesión (nunca por horario). Si un turno lleva demasiadas
+ * horas abierto se avisa una vez por sesión, por si alguien olvidó cerrarla.
+ */
+export async function vigilarCajaAbierta() {
+  const sesion = await obtenerSesionAbierta();
+  if (!sesion) return;
+  const horas = (Date.now() - new Date(sesion.fechaApertura).getTime()) / 3_600_000;
+  if (horas < env.CAJA_ALERTA_HORAS) return;
+  const marca = `[sesion:${sesion.id}]`;
+  const ya = await db.selectFrom('notificaciones').select('id').where('mensaje', 'like', `%${marca}%`).executeTakeFirst();
+  if (ya) return;
+  await db
+    .insertInto('notificaciones')
+    .values({
+      tipo: 'sistema',
+      titulo: '⚠ Caja abierta hace mucho',
+      mensaje: `La caja diaria lleva ${Math.floor(horas)} horas abierta (desde ${new Date(sesion.fechaApertura).toLocaleString('es-CO')}). Recuerda hacer el cierre con arqueo. ${marca}`,
+      clienteId: null,
+      prioridad: 'alta',
+    })
+    .execute();
+  log(`Aviso: caja abierta hace ${Math.floor(horas)} h`);
 }
 
 const safe = (name: string, fn: () => Promise<unknown>) => async () => {
@@ -146,18 +166,7 @@ export function iniciarTareas() {
   if (env.JOB_CONSOLIDACION_AUTO) {
     cron.schedule('30 0 1 * *', safe('consolidación', consolidacionAutomatica), { timezone: tz });
   }
-  if (env.JOB_CIERRE_CAJA_AUTO) {
-    cron.schedule(
-      env.JOB_CIERRE_CAJA_CRON,
-      safe('cierre automático', async () => {
-        const uid = await usuarioSistema();
-        if (!uid) return;
-        const r = await cerrarDiasPendientes(uid);
-        log(`Cierre automático de caja: ${r.length} día(s) cerrados`);
-      }),
-      { timezone: tz },
-    );
-  }
+  cron.schedule('0 * * * *', safe('vigilancia de caja', vigilarCajaAbierta), { timezone: tz });
   // Al arrancar: ponerse al día por si el equipo estuvo apagado
   setTimeout(safe('revisión inicial', revisionDiaria), 3_000);
   if (env.JOB_CONSOLIDACION_AUTO) setTimeout(safe('consolidación inicial', consolidacionAutomatica), 5_000);
@@ -165,6 +174,6 @@ export function iniciarTareas() {
   console.log(
     `   ✓ Tareas automáticas: revisión diaria (${env.JOB_VENCIMIENTOS_CRON})` +
       `${env.JOB_CONSOLIDACION_AUTO ? ', consolidación mensual' : ''}` +
-      `${env.JOB_CIERRE_CAJA_AUTO ? `, cierre de caja (${env.JOB_CIERRE_CAJA_CRON})` : ''}`,
+      `, aviso de caja abierta (> ${env.CAJA_ALERTA_HORAS} h)`,
   );
 }

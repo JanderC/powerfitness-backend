@@ -172,6 +172,7 @@ export interface MovimientosCajaTable {
   cerrado: Def<boolean>;
   cierreCajaId: string | null;
   movimientoCajaFuerteId: string | null;
+  sesionCajaId: Def<string | null>;
 }
 
 export interface CierresCajaTable {
@@ -190,6 +191,30 @@ export interface CierresCajaTable {
   cantidadMovimientos: Def<number>;
   observaciones: string | null;
   usuarioId: string;
+  createdAt: Ts;
+  sesionCajaId: Def<string | null>;
+  efectivoContado: Def<number | null>;
+  diferencia: Def<number | null>;
+}
+
+export type OrigenMontoInicial = 'anterior' | 'caja_fuerte' | 'externo';
+
+export interface SesionesCajaTable {
+  id: Generated<string>;
+  estado: Def<'abierta' | 'cerrada'>;
+  montoInicial: Def<number>;
+  origenMontoInicial: Def<OrigenMontoInicial>;
+  fechaApertura: Ts;
+  usuarioApertura: string;
+  observacionesApertura: string | null;
+  fechaCierre: Date | null;
+  usuarioCierre: string | null;
+  cierreCajaId: string | null;
+  efectivoEsperado: number | null;
+  efectivoContado: number | null;
+  diferencia: number | null;
+  efectivoDejado: number | null;
+  observacionesCierre: string | null;
   createdAt: Ts;
 }
 
@@ -337,6 +362,7 @@ export interface DB {
   consolidadosMensuales: ConsolidadosMensualesTable;
   configuracionCajaFuerte: ConfiguracionCajaFuerteTable;
   movimientosEliminados: MovimientosEliminadosTable;
+  sesionesCaja: SesionesCajaTable;
 }
 
 export type Usuario = Selectable<UsuariosTable>;
@@ -348,3 +374,4 @@ export type MembresiaUpdate = Updateable<MembresiasTable>;
 export type MovimientoCaja = Selectable<MovimientosCajaTable>;
 export type MovimientoCajaFuerte = Selectable<MovimientosCajaFuerteTable>;
 export type CajaFuerte = Selectable<CajaFuerteTable>;
+export type SesionCaja = Selectable<SesionesCajaTable>;

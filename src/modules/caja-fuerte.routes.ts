@@ -9,7 +9,7 @@ import { ah, badRequest, notFound, parse, unauthorized } from '../lib/http.js';
 import { cop, r2, sum, totalesMovimientos } from '../lib/money.js';
 import { sha256Base64 } from '../lib/security.js';
 import { userId } from '../middleware/auth.js';
-import { ajustarBalance, balancePublico, obtenerCajaFuerte } from './caja.service.js';
+import { ajustarBalance, balancePublico, obtenerCajaFuerte, registrarMovimientoCaja } from './caja.service.js';
 
 export const cajaFuerteRouter = Router();
 
@@ -247,23 +247,15 @@ cajaFuerteRouter.post(
       const actual = await obtenerCajaFuerte(trx);
       if (actual.balanceEfectivo < b.monto) throw badRequest(`Saldo insuficiente en efectivo. Disponible: ${cop(actual.balanceEfectivo)}`);
       const desc = b.descripcion ? `Transferencia desde Caja Fuerte: ${b.descripcion}` : 'Transferencia desde Caja Fuerte';
-      const movCaja = await trx
-        .insertInto('movimientosCaja')
-        .values({
-          tipo: 'ingreso',
-          categoria: 'transferencia_cajafuerte',
-          metodoPago: 'efectivo',
-          monto: b.monto,
-          descripcion: desc,
-          referenciaId: null,
-          usuarioId: uid,
-          fecha: new Date(),
-          cerrado: false,
-          cierreCajaId: null,
-          movimientoCajaFuerteId: null,
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow();
+      const movCaja = await registrarMovimientoCaja(trx, {
+        tipo: 'ingreso',
+        categoria: 'transferencia_cajafuerte',
+        metodoPago: 'efectivo',
+        monto: b.monto,
+        descripcion: desc,
+        referenciaId: null,
+        usuarioId: uid,
+      });
       const movCF = await trx
         .insertInto('movimientosCajaFuerte')
         .values({

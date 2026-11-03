@@ -1,6 +1,7 @@
 import { db, type Db } from '../db/index.js';
-import { addDays, formatDMY, parseDateStr, startOfDay, toDateStr, today } from '../lib/dates.js';
-import { badRequest } from '../lib/http.js';
+import type { MovimientosCajaTable, OrigenMontoInicial } from '../db/types.js';
+import type { Insertable } from 'kysely';
+import { badRequest, HttpError } from '../lib/http.js';
 import { cop, r2, totalesMovimientos } from '../lib/money.js';
 
 // ───────────────────────────── CAJA FUERTE ─────────────────────────────
@@ -30,10 +31,10 @@ export const balancePublico = (cf: { balanceEfectivo: number; balanceTransferenc
   total: cf.balanceTotal,
 });
 
-/** Equivalente a CajaFuerteController.RecibirDesdeCajaInternoAsync. */
+/** Envía a Caja Fuerte el efectivo y las transferencias de un cierre (una sola vez por cierre). */
 export async function recibirCierreEnCajaFuerte(
   trx: Db,
-  p: { montoEfectivo: number; montoTransferencia: number; fechaCierre: Date; cierreCajaId: string; usuarioId: string },
+  p: { montoEfectivo: number; montoTransferencia: number; cierreCajaId: string; usuarioId: string; etiqueta: string },
 ) {
   const ya = await trx
     .selectFrom('movimientosCajaFuerte')
@@ -43,7 +44,6 @@ export async function recibirCierreEnCajaFuerte(
     .executeTakeFirst();
   if (ya || (p.montoEfectivo <= 0 && p.montoTransferencia <= 0)) return false;
 
-  const fecha = formatDMY(toDateStr(p.fechaCierre));
   for (const [metodo, monto] of [
     ['efectivo', p.montoEfectivo],
     ['transferencia', p.montoTransferencia],
@@ -56,12 +56,12 @@ export async function recibirCierreEnCajaFuerte(
         origen: 'cierre_caja',
         metodoPago: metodo,
         monto,
-        descripcion: `Cierre de caja del ${fecha} - ${metodo === 'efectivo' ? 'Efectivo' : 'Transferencias'}`,
+        descripcion: `${p.etiqueta} - ${metodo === 'efectivo' ? 'Efectivo' : 'Transferencias'}`,
         categoria: null,
         cierreCajaId: p.cierreCajaId,
         movimientoCajaId: null,
         usuarioId: p.usuarioId,
-        fecha: toDateStr(p.fechaCierre) === today() ? new Date() : p.fechaCierre,
+        fecha: new Date(),
       })
       .execute();
     await ajustarBalance(trx, metodo, monto);
@@ -69,133 +69,225 @@ export async function recibirCierreEnCajaFuerte(
   return true;
 }
 
-// ───────────────────────────── CAJA DIARIA ─────────────────────────────
+// ─────────────────────────── SESIONES DE CAJA DIARIA ───────────────────────────
+//
+// La caja trabaja por sesiones (turnos): se abre con un monto inicial, todos los
+// cobros/pagos quedan ligados a la sesión abierta y se cierra con arqueo.
+// No hay cierres por horario: la sesión dura lo que dure el turno.
 
-/** Inicio del conteo de hoy: después del último cierre del día (permite varios cierres/turnos). */
-export async function inicioPeriodoActual(fecha = today()) {
-  const ini = parseDateStr(fecha);
-  const fin = parseDateStr(addDays(fecha, 1));
-  const ultimo = await db
-    .selectFrom('cierresCaja')
-    .select('createdAt')
-    .where('fechaCierre', '>=', ini)
-    .where('fechaCierre', '<', fin)
-    .orderBy('createdAt', 'desc')
+export const cajaCerrada = () =>
+  new HttpError(409, 'La caja está cerrada. Ábrela desde "Caja diaria" para registrar cobros o pagos.');
+
+export function obtenerSesionAbierta(trx: Db = db) {
+  return trx.selectFrom('sesionesCaja').selectAll().where('estado', '=', 'abierta').executeTakeFirst();
+}
+
+type NuevoMovimiento = Omit<Insertable<MovimientosCajaTable>, 'sesionCajaId' | 'cerrado' | 'cierreCajaId' | 'fecha'> & {
+  cierreCajaId?: null;
+};
+
+/**
+ * Único punto de entrada para registrar dinero en caja diaria
+ * (mensualidades, ventas, abonos, salarios, movimientos manuales, transferencias de CF).
+ * Exige una sesión abierta y deja el movimiento ligado a ella.
+ */
+export async function registrarMovimientoCaja(trx: Db, mov: NuevoMovimiento) {
+  const sesion = await obtenerSesionAbierta(trx);
+  if (!sesion) throw cajaCerrada();
+  return trx
+    .insertInto('movimientosCaja')
+    .values({
+      ...mov,
+      cierreCajaId: null,
+      cerrado: false,
+      fecha: new Date(),
+      sesionCajaId: sesion.id,
+      movimientoCajaFuerteId: mov.movimientoCajaFuerteId ?? null,
+    })
+    .returningAll()
+    .executeTakeFirstOrThrow();
+}
+
+export async function movimientosDeSesion(sesionId: string, trx: Db = db) {
+  return trx.selectFrom('movimientosCaja').selectAll().where('sesionCajaId', '=', sesionId).orderBy('fecha').execute();
+}
+
+/** Totales de una sesión + efectivo que debería haber físicamente en la caja. */
+export function resumenSesion(montoInicial: number, movs: Awaited<ReturnType<typeof movimientosDeSesion>>) {
+  const t = totalesMovimientos(movs);
+  return { ...t, montoInicial, efectivoEsperado: r2(montoInicial + t.efectivo.balance), cantidad: movs.length };
+}
+
+/** Base sugerida para abrir: lo que se dejó en caja en el último cierre. */
+export async function baseSugerida() {
+  const ultima = await db
+    .selectFrom('sesionesCaja')
+    .select(['efectivoDejado', 'fechaCierre'])
+    .where('estado', '=', 'cerrada')
+    .orderBy('fechaCierre', 'desc')
     .executeTakeFirst();
-  return ultimo ? new Date(ultimo.createdAt) : ini;
+  return { monto: ultima?.efectivoDejado ?? 0, fechaCierre: ultima?.fechaCierre ?? null };
 }
 
-export async function movimientosPeriodoActual(fecha = today()) {
-  const desde = await inicioPeriodoActual(fecha);
-  return db
-    .selectFrom('movimientosCaja')
-    .selectAll()
-    .where('fecha', '>=', desde)
-    .where('fecha', '<', parseDateStr(addDays(fecha, 1)))
-    .orderBy('fecha')
-    .execute();
-}
-
-export interface CerrarCajaInput {
-  fecha?: string;
-  efectivoADejar?: number;
+export interface AbrirCajaInput {
+  montoInicial: number;
+  origen: OrigenMontoInicial;
   observaciones?: string | null;
-  tipoCierre?: 'manual' | 'automatico';
 }
 
-/** Equivalente a CajaController.CerrarCaja (.NET). */
-export async function cerrarCaja(input: CerrarCajaInput, usuarioId: string) {
-  const fecha = input.fecha ?? today();
+export async function abrirCaja(input: AbrirCajaInput, usuarioId: string) {
   return db.transaction().execute(async (trx) => {
-    const pendientes = await trx
-      .selectFrom('movimientosCaja')
-      .selectAll()
-      .where('cerrado', '=', false)
-      .where('fecha', '>=', parseDateStr(fecha))
-      .where('fecha', '<', parseDateStr(addDays(fecha, 1)))
-      .orderBy('fecha')
-      .forUpdate()
-      .execute();
-    if (!pendientes.length) throw badRequest(`No hay movimientos pendientes para cerrar el día ${formatDMY(fecha)}`);
+    if (await obtenerSesionAbierta(trx)) throw badRequest('Ya hay una caja abierta. Ciérrala antes de abrir una nueva.');
 
-    const t = totalesMovimientos(pendientes);
-    const efectivoADejar = input.efectivoADejar ?? 0;
-    if (efectivoADejar < 0) throw badRequest('El efectivo a dejar no puede ser negativo');
-    if (efectivoADejar > t.efectivo.balance) {
-      throw badRequest(`El efectivo a dejar (${cop(efectivoADejar)}) no puede ser mayor al balance de efectivo (${cop(t.efectivo.balance)})`);
-    }
-    const efectivoACF = r2(t.efectivo.balance - efectivoADejar);
-    const transferenciaACF = t.transferencia.balance;
-
-    const cierre = await trx
-      .insertInto('cierresCaja')
+    const sesion = await trx
+      .insertInto('sesionesCaja')
       .values({
-        fechaCierre: parseDateStr(fecha),
-        tipoCierre: input.tipoCierre ?? 'manual',
-        efectivoInicial: 0,
-        ingresosEfectivo: t.efectivo.ingresos,
-        egresosEfectivo: t.efectivo.egresos,
-        efectivoFinal: efectivoACF,
-        ingresosTransferencia: t.transferencia.ingresos,
-        egresosTransferencia: t.transferencia.egresos,
-        totalIngresos: t.totalIngresos,
-        totalEgresos: t.totalEgresos,
-        balanceGeneral: t.balance,
-        cantidadMovimientos: pendientes.length,
-        observaciones: [
-          input.observaciones?.trim(),
-          `Cierre del día ${formatDMY(fecha)}. Efectivo dejado en caja: ${cop(efectivoADejar)}, a Caja Fuerte: ${cop(efectivoACF)}`,
-        ]
-          .filter(Boolean)
-          .join(' - '),
-        usuarioId,
-        createdAt: new Date(),
+        estado: 'abierta',
+        montoInicial: input.montoInicial,
+        origenMontoInicial: input.origen,
+        fechaApertura: new Date(),
+        usuarioApertura: usuarioId,
+        observacionesApertura: input.observaciones || null,
+        fechaCierre: null,
+        usuarioCierre: null,
+        cierreCajaId: null,
+        efectivoEsperado: null,
+        efectivoContado: null,
+        diferencia: null,
+        efectivoDejado: null,
+        observacionesCierre: null,
       })
       .returningAll()
       .executeTakeFirstOrThrow();
 
-    await trx
+    // La base sale de la Caja Fuerte: se descuenta de su efectivo
+    if (input.origen === 'caja_fuerte' && input.montoInicial > 0) {
+      const cf = await obtenerCajaFuerte(trx);
+      if (cf.balanceEfectivo < input.montoInicial) {
+        throw badRequest(`La Caja Fuerte solo tiene ${cop(cf.balanceEfectivo)} en efectivo`);
+      }
+      await trx
+        .insertInto('movimientosCajaFuerte')
+        .values({
+          tipo: 'egreso',
+          origen: 'transferencia_a_caja',
+          metodoPago: 'efectivo',
+          monto: input.montoInicial,
+          descripcion: 'Base para apertura de caja diaria',
+          categoria: 'base_caja',
+          cierreCajaId: null,
+          movimientoCajaId: null,
+          usuarioId,
+          fecha: new Date(),
+        })
+        .execute();
+      await ajustarBalance(trx, 'efectivo', -input.montoInicial);
+    }
+
+    // Movimientos que quedaron sin cerrar del sistema anterior (o sin sesión) pasan a esta sesión
+    const huerfanos = await trx
       .updateTable('movimientosCaja')
-      .set({ cerrado: true, cierreCajaId: cierre.id })
-      .where(
-        'id',
-        'in',
-        pendientes.map((m) => m.id),
-      )
-      .execute();
+      .set({ sesionCajaId: sesion.id })
+      .where('cerrado', '=', false)
+      .where('sesionCajaId', 'is', null)
+      .executeTakeFirst();
+
+    return { sesion, movimientosAdoptados: Number(huerfanos.numUpdatedRows ?? 0) };
+  });
+}
+
+export interface CerrarSesionInput {
+  efectivoContado: number;
+  efectivoADejar: number;
+  observaciones?: string | null;
+}
+
+/** Cierre con arqueo: compara lo contado vs lo esperado y envía el dinero a Caja Fuerte. */
+export async function cerrarSesion(input: CerrarSesionInput, usuarioId: string) {
+  return db.transaction().execute(async (trx) => {
+    const sesion = await trx.selectFrom('sesionesCaja').selectAll().where('estado', '=', 'abierta').forUpdate().executeTakeFirst();
+    if (!sesion) throw badRequest('No hay una caja abierta para cerrar');
+    if (input.efectivoContado < 0 || input.efectivoADejar < 0) throw badRequest('Los montos no pueden ser negativos');
+    if (input.efectivoADejar > input.efectivoContado) {
+      throw badRequest(`No puedes dejar ${cop(input.efectivoADejar)} si contaste ${cop(input.efectivoContado)}`);
+    }
+
+    const movs = await movimientosDeSesion(sesion.id, trx);
+    const r = resumenSesion(sesion.montoInicial, movs);
+    const diferencia = r2(input.efectivoContado - r.efectivoEsperado);
+    const efectivoACF = r2(input.efectivoContado - input.efectivoADejar);
+    const transferenciaACF = Math.max(r.transferencia.balance, 0);
+    const ahora = new Date();
+    const estadoArqueo = diferencia === 0 ? 'cuadró' : diferencia > 0 ? `sobrante de ${cop(diferencia)}` : `faltante de ${cop(-diferencia)}`;
+
+    const cierre = await trx
+      .insertInto('cierresCaja')
+      .values({
+        fechaCierre: ahora,
+        tipoCierre: 'sesion',
+        efectivoInicial: sesion.montoInicial,
+        ingresosEfectivo: r.efectivo.ingresos,
+        egresosEfectivo: r.efectivo.egresos,
+        efectivoFinal: efectivoACF,
+        ingresosTransferencia: r.transferencia.ingresos,
+        egresosTransferencia: r.transferencia.egresos,
+        totalIngresos: r.totalIngresos,
+        totalEgresos: r.totalEgresos,
+        balanceGeneral: r.balance,
+        cantidadMovimientos: movs.length,
+        observaciones: [
+          input.observaciones?.trim(),
+          `Arqueo: esperado ${cop(r.efectivoEsperado)}, contado ${cop(input.efectivoContado)} (${estadoArqueo}). Base dejada: ${cop(input.efectivoADejar)}`,
+        ]
+          .filter(Boolean)
+          .join(' - '),
+        usuarioId,
+        createdAt: ahora,
+        sesionCajaId: sesion.id,
+        efectivoContado: input.efectivoContado,
+        diferencia,
+      })
+      .returningAll()
+      .executeTakeFirstOrThrow();
+
+    if (movs.length) {
+      await trx
+        .updateTable('movimientosCaja')
+        .set({ cerrado: true, cierreCajaId: cierre.id })
+        .where('sesionCajaId', '=', sesion.id)
+        .execute();
+    }
 
     const enviado = await recibirCierreEnCajaFuerte(trx, {
       montoEfectivo: efectivoACF,
       montoTransferencia: transferenciaACF,
-      fechaCierre: parseDateStr(fecha),
       cierreCajaId: cierre.id,
       usuarioId,
+      etiqueta: `Cierre de caja (${ahora.toLocaleDateString('es-CO')} ${ahora.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })})`,
     });
 
+    const cerrada = await trx
+      .updateTable('sesionesCaja')
+      .set({
+        estado: 'cerrada',
+        fechaCierre: ahora,
+        usuarioCierre: usuarioId,
+        cierreCajaId: cierre.id,
+        efectivoEsperado: r.efectivoEsperado,
+        efectivoContado: input.efectivoContado,
+        diferencia,
+        efectivoDejado: input.efectivoADejar,
+        observacionesCierre: input.observaciones || null,
+      })
+      .where('id', '=', sesion.id)
+      .returningAll()
+      .executeTakeFirstOrThrow();
+
     return {
+      sesion: cerrada,
       cierre,
-      resumen: { ...t, efectivoADejar, efectivoACajaFuerte: efectivoACF, transferenciaACajaFuerte: transferenciaACF },
+      resumen: { ...r, efectivoContado: input.efectivoContado, diferencia, efectivoADejar: input.efectivoADejar, efectivoACajaFuerte: efectivoACF, transferenciaACajaFuerte: transferenciaACF },
       enviadoACajaFuerte: enviado,
     };
   });
-}
-
-/** Para el cierre automático: cierra todos los días anteriores que quedaron abiertos y el de hoy. */
-export async function cerrarDiasPendientes(usuarioId: string) {
-  const rows = await db
-    .selectFrom('movimientosCaja')
-    .select('fecha')
-    .where('cerrado', '=', false)
-    .where('fecha', '<', startOfDay(new Date(Date.now() + 86_400_000)))
-    .execute();
-  const dias = [...new Set(rows.map((r) => toDateStr(new Date(r.fecha))))].sort();
-  const resultados = [];
-  for (const dia of dias) {
-    try {
-      resultados.push(await cerrarCaja({ fecha: dia, tipoCierre: 'automatico', observaciones: 'Cierre automático' }, usuarioId));
-    } catch (err) {
-      console.warn(`  ⚠ No se pudo cerrar ${dia}: ${(err as Error).message}`);
-    }
-  }
-  return resultados;
 }

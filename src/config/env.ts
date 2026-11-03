@@ -41,8 +41,8 @@ const schema = z.object({
 
   JOB_VENCIMIENTOS_CRON: z.string().default('5 0 * * *'),
   JOB_CONSOLIDACION_AUTO: bool,
-  JOB_CIERRE_CAJA_AUTO: bool,
-  JOB_CIERRE_CAJA_CRON: z.string().default('55 23 * * *'),
+  // La caja se cierra por sesión; solo se avisa si un turno pasa de estas horas abierto
+  CAJA_ALERTA_HORAS: z.coerce.number().positive().default(14),
   ABRIR_NAVEGADOR: bool,
 });
 

@@ -3,6 +3,7 @@ import type { Plan } from '../db/types.js';
 import { addDays, addMonths, addYears, diffDays, formatDMY, today } from '../lib/dates.js';
 import { badRequest, notFound } from '../lib/http.js';
 import { cop, r2 } from '../lib/money.js';
+import { registrarMovimientoCaja } from './caja.service.js';
 
 type PlanCalc = Pick<Plan, 'tipoCalculoVencimiento' | 'cantidadUnidades' | 'duracionDias'>;
 
@@ -95,21 +96,15 @@ async function registrarCobro(i: CobroInput) {
         notas: saldo > 0 ? 'Pago parcial de membresía' : i.notaPago,
       })
       .execute();
-    await i.trx
-      .insertInto('movimientosCaja')
-      .values({
-        tipo: 'ingreso',
-        categoria: i.categoria,
-        monto: i.montoPagado,
-        descripcion: i.descripcion + (saldo > 0 ? ` (Pago parcial, saldo: ${cop(saldo)})` : ''),
-        referenciaId: i.membresiaId,
-        usuarioId: i.usuarioId,
-        metodoPago: i.metodoPago,
-        fecha: new Date(),
-        cierreCajaId: null,
-        movimientoCajaFuerteId: null,
-      })
-      .execute();
+    await registrarMovimientoCaja(i.trx, {
+      tipo: 'ingreso',
+      categoria: i.categoria,
+      monto: i.montoPagado,
+      descripcion: i.descripcion + (saldo > 0 ? ` (Pago parcial, saldo: ${cop(saldo)})` : ''),
+      referenciaId: i.membresiaId,
+      usuarioId: i.usuarioId,
+      metodoPago: i.metodoPago,
+    });
   }
 
   let deudaId: string | null = null;
