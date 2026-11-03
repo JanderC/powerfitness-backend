@@ -30,7 +30,7 @@ async function main() {
     console.log('═══════════════════════════════════════════════════════');
     console.log(`   ✓ API:            ${url}/api`);
     console.log(`   ✓ Zona horaria:   ${env.TZ} (${new Date().toLocaleString('es-CO')})`);
-    const dbInfo = env.DATABASE_URL ? (() => { const u = new URL(env.DATABASE_URL); return `${u.pathname.slice(1)}@${u.hostname}:${u.port}`; })() : `${env.DB_NAME}@${env.DB_HOST}:${env.DB_PORT}`;
+    const dbInfo = env.DATABASE_URL ? (() => { const u = new URL(env.DATABASE_URL); return `${u.pathname.slice(1)}@${u.hostname}:${u.port || 5432}`; })() : `${env.DB_NAME}@${env.DB_HOST}:${env.DB_PORT}`;
     console.log(`   ✓ Base de datos:  ${dbInfo}`);
     if (isProd) {
       console.log(`   📱 Kiosko:         ${url}/kiosko`);
